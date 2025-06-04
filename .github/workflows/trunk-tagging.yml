@@ -87,94 +87,118 @@ jobs:
             echo "✅ Commit ${COMMIT_SHA} is valid (automatic push trigger)"
           fi
 
-      - name: Check if tag already exists
-        id: check_tag
-        run: |
-          TAG_NAME="${{ steps.commit.outputs.tag_name }}"
-          
-          # Check if tag exists locally
-          if git tag -l "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag ${TAG_NAME} already exists locally"
-            exit 0
-          fi
-          
-          # Check if tag exists on remote
-          if git ls-remote --tags origin "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag ${TAG_NAME} already exists on remote"
-            exit 0
-          fi
-          
-          echo "exists=false" >> $GITHUB_OUTPUT
-          echo "Tag ${TAG_NAME} does not exist, proceeding with creation"
-
       - name: Create and push tag with retry
-        if: steps.check_tag.outputs.exists == 'false'
         env:
           TAG_NAME: ${{ steps.commit.outputs.tag_name }}
           COMMIT_SHA: ${{ steps.commit.outputs.sha }}
         run: |
           set -e
           
-          # Reduced retry parameters for testing
+          # Check if tag already exists
+          check_tag_exists() {
+            # Check if tag exists locally
+            if git tag -l "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
+              echo "Tag ${TAG_NAME} already exists locally"
+              return 0
+            fi
+            
+            # Check if tag exists on remote
+            if git ls-remote --tags origin "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
+              echo "Tag ${TAG_NAME} already exists on remote"
+              return 0
+            fi
+            
+            return 1
+          }
+          
+          # Exit early if tag already exists
+          if check_tag_exists; then
+            echo "✅ Tag already exists - no action needed"
+            exit 0
+          fi
+          
+          echo "Tag ${TAG_NAME} does not exist, proceeding with creation"
+          
+          # Retry configuration (reduced for testing)
           MAX_RETRIES=3
-          RETRY_COUNT=0
           BASE_DELAY=2
           BACKOFF_MULTIPLIER=2
           MAX_DELAY=30
           
-          calculate_delay() {
-            local attempt=$1
-            local delay=$((BASE_DELAY * (BACKOFF_MULTIPLIER ** attempt)))
-            if [ $delay -gt $MAX_DELAY ]; then
-              delay=$MAX_DELAY
-            fi
-            echo $delay
+          # Common retry function with exponential backoff
+          retry_with_backoff() {
+            local command="$1"
+            local description="$2"
+            local retry_count=0
+            
+            while [ $retry_count -le $MAX_RETRIES ]; do
+              echo "Attempt $((retry_count + 1))/$((MAX_RETRIES + 1)): ${description}"
+              
+              if eval "${command}"; then
+                echo "Success on attempt $((retry_count + 1))"
+                return 0
+              fi
+              
+              retry_count=$((retry_count + 1))
+              
+              if [ $retry_count -le $MAX_RETRIES ]; then
+                # Calculate delay with exponential backoff
+                local delay=$((BASE_DELAY * (BACKOFF_MULTIPLIER ** retry_count)))
+                if [ $delay -gt $MAX_DELAY ]; then
+                  delay=$MAX_DELAY
+                fi
+                
+                echo "Failed. Retrying in ${delay} seconds..."
+                sleep $delay
+              fi
+            done
+            
+            echo "All retry attempts exhausted"
+            return 1
           }
           
+          # Function to create and push tag
           create_and_push_tag() {
-            echo "Attempt $((RETRY_COUNT + 1))/$((MAX_RETRIES + 1)): Creating tag ${TAG_NAME} for commit ${COMMIT_SHA}"
-            
             # Create the tag
-            git tag "${TAG_NAME}" "${COMMIT_SHA}"
+            if ! git tag "${TAG_NAME}" "${COMMIT_SHA}"; then
+              echo "Failed to create local tag"
+              return 1
+            fi
             
             # Push the tag
-            git push origin "${TAG_NAME}"
-            
-            echo "Successfully created and pushed tag ${TAG_NAME}"
-            return 0
+            if git push origin "${TAG_NAME}"; then
+              echo "Successfully created and pushed tag ${TAG_NAME}"
+              return 0
+            else
+              echo "Failed to push tag to remote"
+              # Clean up local tag for retry
+              git tag -d "${TAG_NAME}" 2>/dev/null || true
+              return 1
+            fi
           }
           
-          while [ $RETRY_COUNT -le $MAX_RETRIES ]; do
-            if create_and_push_tag; then
-              echo "Tag creation succeeded on attempt $((RETRY_COUNT + 1))"
-              exit 0
+          # Function to handle retries with race condition checks
+          tag_with_retry() {
+            # Check if tag exists before attempting creation
+            if check_tag_exists; then
+              echo "Tag ${TAG_NAME} was created by another process, exiting successfully"
+              return 0
             fi
             
-            RETRY_COUNT=$((RETRY_COUNT + 1))
-            
-            if [ $RETRY_COUNT -le $MAX_RETRIES ]; then
-              DELAY=$(calculate_delay $RETRY_COUNT)
-              echo "Attempt $RETRY_COUNT failed. Retrying in ${DELAY} seconds..."
-              sleep $DELAY
-              
-              # Clean up any partially created local tag before retry
-              git tag -d "${TAG_NAME}" 2>/dev/null || true
-              
-              # Fetch latest state from remote in case of race conditions
+            create_and_push_tag || {
+              # Fetch latest state for next retry
               git fetch origin --tags
-              
-              # Check again if tag was created by another process
-              if git ls-remote --tags origin "${TAG_NAME}" | grep -q "${TAG_NAME}"; then
-                echo "Tag ${TAG_NAME} was created by another process during retry, exiting successfully"
-                exit 0
-              fi
-            else
-              echo "All retry attempts exhausted. Tag creation failed."
-              exit 1
-            fi
-          done
+              return 1
+            }
+          }
+          
+          # Execute with retry
+          if retry_with_backoff "tag_with_retry" "Creating tag ${TAG_NAME} for commit ${COMMIT_SHA}"; then
+            exit 0
+          else
+            echo "Tag creation failed after all retry attempts"
+            exit 1
+          fi
 
       - name: Tag creation summary
         if: always()
