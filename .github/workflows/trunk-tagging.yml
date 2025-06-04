@@ -25,6 +25,23 @@ jobs:
     # Removed pytorch-specific condition for testing
     
     steps:
+      - name: Pre-checkout validation
+        run: |
+          # For workflow_dispatch, validate SHA format before checkout
+          if [ -n "${{ github.event.inputs.commit_sha }}" ]; then
+            COMMIT_SHA="${{ github.event.inputs.commit_sha }}"
+            
+            # Verify it's a well-formed SHA (40 hex characters)
+            if ! echo "${COMMIT_SHA}" | grep -qE '^[a-f0-9]{40}$'; then
+              echo "Error: Invalid commit SHA format. Expected 40 hexadecimal characters, got: ${COMMIT_SHA}"
+              exit 1
+            fi
+            
+            echo "✅ Pre-checkout validation passed for: ${COMMIT_SHA}"
+          else
+            echo "✅ Using current commit SHA - no pre-checkout validation needed"
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -47,12 +64,6 @@ jobs:
       - name: Validate commit SHA
         run: |
           COMMIT_SHA="${{ steps.commit.outputs.sha }}"
-          
-          # Verify it's a well-formed SHA (40 hex characters)
-          if ! echo "${COMMIT_SHA}" | grep -qE '^[a-f0-9]{40}$'; then
-            echo "Error: Invalid commit SHA format. Expected 40 hexadecimal characters, got: ${COMMIT_SHA}"
-            exit 1
-          fi
           
           # Verify the commit exists and is valid
           if ! git cat-file -e "${COMMIT_SHA}"; then
